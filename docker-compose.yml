@@ -1,0 +1,242 @@
+x-postgres-env: &postgres-env
+  POSTGRES_USER: ${POSTGRES_USER:-water_heritage}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Heritage@2024!}
+  POSTGRES_DB: ${POSTGRES_DB:-water_heritage}
+
+x-redis-env: &redis-env
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-Redis@2024!}
+
+x-backend-env: &backend-env
+  <<: [*postgres-env, *redis-env]
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  ENV: production
+  DEBUG: "false"
+  MQTT_HOST: mosquitto
+  MQTT_PORT: 1883
+  CORS_ORIGINS: '["*"]'
+  PYTHONPATH: /app
+
+services:
+  # ============== PostgreSQL + PostGIS ==============
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: wh-postgres
+    restart: unless-stopped
+    environment:
+      <<: *postgres-env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_database.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./scripts/upgrade_v2.sql:/docker-entrypoint-initdb.d/02_upgrade.sql:ro
+      - ./deploy/sql/spatial_indexes.sql:/docker-entrypoint-initdb.d/03_indexes.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-water_heritage}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c max_connections=200
+      -c work_mem=4MB
+      -c maintenance_work_mem=64MB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+    networks:
+      - heritage-net
+
+  # ============== Redis ==============
+  redis:
+    image: redis:7-alpine
+    container_name: wh-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-Redis@2024!}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-Redis@2024!}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - heritage-net
+
+  # ============== MQTT Broker (Eclipse Mosquitto) ==============
+  mosquitto:
+    image: eclipse-mosquitto:2.0-alpine
+    container_name: wh-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'PING' | nc -w 2 localhost 1883 | grep -q 'CONNACK' || true"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - heritage-net
+
+  # ============== 微服务: heritage_loader ==============
+  heritage-loader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: heritage_loader
+    container_name: wh-heritage-loader
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8001"
+    networks:
+      - heritage-net
+
+  # ============== 微服务: hydro_reconstructor ==============
+  hydro-reconstructor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: hydro_reconstructor
+    container_name: wh-hydro-reconstructor
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8002"
+    networks:
+      - heritage-net
+
+  # ============== 微服务: sustainability_evaluator ==============
+  sustainability-evaluator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: sustainability_evaluator
+    container_name: wh-sustainability
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8003"
+    networks:
+      - heritage-net
+
+  # ============== 微服务: alarm_publisher ==============
+  alarm-publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: alarm_publisher
+    container_name: wh-alarm-publisher
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    expose:
+      - "8004"
+    networks:
+      - heritage-net
+
+  # ============== API 网关 ==============
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: gateway
+    container_name: wh-gateway
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    depends_on:
+      - heritage-loader
+      - hydro-reconstructor
+      - sustainability-evaluator
+      - alarm-publisher
+    expose:
+      - "8000"
+    networks:
+      - heritage-net
+
+  # ============== 前端 + Nginx (Gzip) ==============
+  frontend:
+    image: nginx:1.27-alpine
+    container_name: wh-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - gateway
+    networks:
+      - heritage-net
+
+  # ============== 数据模拟器 ==============
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: simulator
+    container_name: wh-simulator
+    restart: "no"
+    environment:
+      <<: *backend-env
+      SIMULATOR_SITES: ${SIMULATOR_SITES:-300}
+      SIMULATOR_DYNASTY: ${SIMULATOR_DYNASTY:-all}
+      SIMULATOR_SITE_TYPE: ${SIMULATOR_SITE_TYPE:-all}
+      SIMULATOR_SEED: ${SIMULATOR_SEED:-42}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - simulator
+    networks:
+      - heritage-net
+
+volumes:
+  postgres-data:
+  redis-data:
+  mosquitto-data:
+  mosquitto-log:
+
+networks:
+  heritage-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
